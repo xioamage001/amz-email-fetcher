@@ -9,7 +9,7 @@ const config = require('./config');
 const supabase = createClient(config.supabase.url, config.supabase.anonKey);
 
 function log(msg) {
-  const time = new Date().toLocaleString('zh-CN', { timeZone: config.schedule.timezone });
+  const time = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
   console.log(`[${time}] ${msg}`);
 }
 
@@ -153,7 +153,7 @@ function extractReportDate(subject) {
   if (match) {
     return `${match[3]}-${match[1]}-${match[2]}`;
   }
-  return new Date().toLocaleDateString('sv-SE', { timeZone: config.schedule.timezone }).slice(0, 10);
+  return new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' }).slice(0, 10);
 }
 
 async function downloadCSV(url) {
