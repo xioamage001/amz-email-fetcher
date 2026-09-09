@@ -6,15 +6,13 @@ const cheerio = require('cheerio');
 const { createClient } = require('@supabase/supabase-js');
 const config = require('./config');
 
-// 初始化 Supabase 客户端
 const supabase = createClient(config.supabase.url, config.supabase.anonKey);
 
 function log(msg) {
-  const time = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+  const time = new Date().toLocaleString('zh-CN', { timeZone: config.schedule.timezone });
   console.log(`[${time}] ${msg}`);
 }
 
-// 连接邮箱并搜索邮件
 function searchEmails() {
   return new Promise((resolve, reject) => {
     const imap = new Imap({
@@ -23,6 +21,8 @@ function searchEmails() {
       host: config.email.host,
       port: config.email.port,
       tls: config.email.tls,
+      connTimeout: 30000,
+      authTimeout: 30000,
     });
 
     imap.once('ready', () => {
@@ -121,10 +121,8 @@ function searchEmails() {
   });
 }
 
-// 从邮件HTML中提取下载链接
 function extractDownloadLink(email) {
   const $ = cheerio.load(email.html);
-
   let link = null;
   $('a').each((i, el) => {
     const text = $(el).text().trim();
@@ -134,7 +132,6 @@ function extractDownloadLink(email) {
       return false;
     }
   });
-
   if (!link) {
     $('a').each((i, el) => {
       const href = $(el).attr('href') || '';
@@ -144,65 +141,46 @@ function extractDownloadLink(email) {
       }
     });
   }
-
   if (!link && email.text) {
     const urlMatch = email.text.match(/https?:\/\/[^\s<>"']+/);
     if (urlMatch) link = urlMatch[0];
   }
-
   return link;
 }
 
-// 从邮件主题提取报告日期
 function extractReportDate(subject) {
   const match = subject.match(/(\d{2})\/(\d{2})\/(\d{4})/);
   if (match) {
-    const month = match[1];
-    const day = match[2];
-    const year = match[3];
-    return `${year}-${month}-${day}`;
+    return `${match[3]}-${match[1]}-${match[2]}`;
   }
-  return new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' }).slice(0, 10);
+  return new Date().toLocaleDateString('sv-SE', { timeZone: config.schedule.timezone }).slice(0, 10);
 }
 
-// 下载CSV文件
 async function downloadCSV(url) {
   log('正在下载报告: ' + url.substring(0, 80) + '...');
   const response = await fetch(url, {
     redirect: 'follow',
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-    },
+    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
     timeout: 60000,
   });
-
-  if (!response.ok) {
-    throw new Error(`下载失败: HTTP ${response.status}`);
-  }
-
+  if (!response.ok) throw new Error(`下载失败: HTTP ${response.status}`);
   const text = await response.text();
   log(`下载成功，文件大小: ${text.length} 字节`);
   return text;
 }
 
-// 解析CSV
 function parseCSV(csvText) {
   return new Promise((resolve, reject) => {
     Papa.parse(csvText, {
       header: true,
       skipEmptyLines: true,
-      complete: (results) => {
-        if (results.errors && results.errors.length > 0) {
-          log(`CSV解析警告: ${results.errors.length} 个错误`);
-        }
-        resolve(results.data);
-      },
+      complete: (results) => resolve(results.data),
       error: (err) => reject(err),
     });
   });
 }
 
-// 存到Supabase
+// 适配新表结构 amazon_ads_daily_reports
 async function saveToSupabase(dateKey, rows, fileName) {
   log(`正在存储数据到Supabase: date=${dateKey}, rows=${rows.length}`);
 
@@ -220,42 +198,51 @@ async function saveToSupabase(dateKey, rows, fileName) {
   let mergedRows = rows;
   let source = 'email_auto';
 
-  if (existing && existing.rows && existing.rows.length > 0) {
-    log(`当天已有 ${existing.rows.length} 行数据，正在合并去重...`);
+  if (existing && existing.raw_data && existing.raw_data.length > 0) {
+    log(`当天已有 ${existing.raw_data.length} 行数据，正在合并去重...`);
     const existingMap = new Map();
-    existing.rows.forEach(row => {
+    existing.raw_data.forEach(row => {
       const key = `${row['搜索词'] || row['Search term'] || ''}_${row['活动名称'] || row['Campaign Name'] || ''}_${row['广告组'] || row['Ad Group'] || ''}`;
       existingMap.set(key, row);
     });
-
     rows.forEach(row => {
       const key = `${row['搜索词'] || row['Search term'] || ''}_${row['活动名称'] || row['Campaign Name'] || ''}_${row['广告组'] || row['Ad Group'] || ''}`;
       existingMap.set(key, row);
     });
-
     mergedRows = Array.from(existingMap.values());
     source = 'email_auto_merged';
     log(`合并后共 ${mergedRows.length} 行数据`);
   }
 
+  // 计算汇总指标
+  let totalSpend = 0, totalClicks = 0, totalOrders = 0, totalSales = 0;
+  mergedRows.forEach(row => {
+    totalSpend += parseFloat(row['总成本（已转换）'] || row['总成本'] || row['Spend'] || 0);
+    totalClicks += parseInt(row['点击量'] || row['Clicks'] || 0);
+    totalOrders += parseInt(row['归因于点击的购买量'] || row['Orders'] || 0);
+    totalSales += parseFloat(row['归因于点击的销售额（已换算）'] || row['销售额'] || row['Sales'] || 0);
+  });
+
   const record = {
     user_id: config.supabase.userId,
     date_key: dateKey,
     file_name: fileName,
-    rows: mergedRows,
-    result: null,
-    data_quality: {
-      totalRows: mergedRows.length,
-      columns: mergedRows.length > 0 ? Object.keys(mergedRows[0]).length : 0,
-      source: 'email',
-      fetchedAt: new Date().toISOString(),
-    },
     source: source,
+    total_rows: mergedRows.length,
+    total_columns: mergedRows.length > 0 ? Object.keys(mergedRows[0]).length : 0,
+    raw_data: mergedRows,
+    summary: {
+      spend: Math.round(totalSpend * 100) / 100,
+      clicks: totalClicks,
+      orders: totalOrders,
+      sales: Math.round(totalSales * 100) / 100,
+      acos: totalSales > 0 ? Math.round(totalSpend / totalSales * 1000) / 10 : 0,
+      cvr: totalClicks > 0 ? Math.round(totalOrders / totalClicks * 1000) / 10 : 0,
+    },
     updated_at: new Date().toISOString(),
   };
 
   if (existing) {
-    record.created_at = existing.created_at;
     const { error: updateError } = await supabase
       .from(config.tableName)
       .update(record)
@@ -274,32 +261,22 @@ async function saveToSupabase(dateKey, rows, fileName) {
   return mergedRows.length;
 }
 
-// 处理单封邮件
 async function processEmail(email) {
   const dateKey = extractReportDate(email.subject);
   log(`处理邮件: ${email.subject} (报告日期: ${dateKey})`);
 
   const downloadUrl = extractDownloadLink(email);
-  if (!downloadUrl) {
-    throw new Error(`未在邮件中找到下载链接: ${email.subject}`);
-  }
-  log(`找到下载链接: ${downloadUrl.substring(0, 80)}...`);
+  if (!downloadUrl) throw new Error(`未找到下载链接: ${email.subject}`);
 
   const csvText = await downloadCSV(downloadUrl);
   const rows = await parseCSV(csvText);
   log(`CSV解析完成: ${rows.length} 行, ${rows.length > 0 ? Object.keys(rows[0]).length : 0} 列`);
-
-  if (rows.length === 0) {
-    throw new Error('CSV解析后无数据');
-  }
+  if (rows.length === 0) throw new Error('CSV解析后无数据');
 
   const fileName = `Search_term_${dateKey}.csv`;
-  const savedRows = await saveToSupabase(dateKey, rows, fileName);
-
-  return { dateKey, rowCount: savedRows, fileName };
+  return await saveToSupabase(dateKey, rows, fileName);
 }
 
-// 主拉取流程
 async function fetchReports() {
   const startTime = new Date();
   log('========== 开始拉取亚马逊搜索词报告 ==========');
@@ -315,9 +292,7 @@ async function fetchReports() {
     const dateMap = new Map();
     emails.forEach(email => {
       const dateKey = extractReportDate(email.subject);
-      if (!dateMap.has(dateKey)) {
-        dateMap.set(dateKey, email);
-      }
+      if (!dateMap.has(dateKey)) dateMap.set(dateKey, email);
     });
     log(`去重后共 ${dateMap.size} 个不同日期的报告`);
 
@@ -325,8 +300,8 @@ async function fetchReports() {
     const errors = [];
     for (const [dateKey, email] of dateMap) {
       try {
-        const result = await processEmail(email);
-        results.push(result);
+        const rowCount = await processEmail(email);
+        results.push({ dateKey, rowCount });
       } catch (err) {
         log(`处理 ${dateKey} 失败: ${err.message}`);
         errors.push({ dateKey, error: err.message });
@@ -341,31 +316,28 @@ async function fetchReports() {
       emailCount: emails.length,
       processed: results.length,
       failed: errors.length,
-      results: results,
-      errors: errors,
+      results,
+      errors,
     };
-
   } catch (error) {
     log('拉取失败: ' + error.message);
     return { success: false, error: error.message };
   }
 }
 
-// 主入口
 async function main() {
-  log('亚马逊广告AI分析助手 - 邮箱自动拉取（GitHub Actions版）');
+  log('亚马逊广告AI分析助手 - 邮箱自动拉取服务（GitHub Actions版 v2）');
   log(`邮箱: ${config.email.user}`);
   log(`IMAP: ${config.email.host}:${config.email.port}`);
   log(`Supabase: ${config.supabase.url}`);
+  log(`数据表: ${config.tableName}`);
   log('----------------------------------------');
 
   const result = await fetchReports();
-
   if (!result.success) {
     console.error('::error::拉取失败: ' + (result.error || JSON.stringify(result.errors)));
     process.exit(1);
   }
-
   console.log('::set-output name=result::' + JSON.stringify(result));
   process.exit(0);
 }
