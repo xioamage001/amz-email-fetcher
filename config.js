@@ -1,22 +1,14 @@
-// 配置文件 - 从环境变量读取（GitHub Actions Secrets）
+// 配置文件 - 多租户版
+// 邮箱配置不再从这里读取，而是从Supabase数据库的 amazon_ads_user_configs 表按租户读取
+// 这里只保留系统级配置
 module.exports = {
-  // 邮箱配置
-  email: {
-    user: process.env.EMAIL_USER || 'mahejun163@163.com',
-    password: process.env.EMAIL_PASSWORD || '',
-    host: process.env.EMAIL_HOST || 'imap.163.com',
-    port: parseInt(process.env.EMAIL_PORT || '993'),
-    tls: process.env.EMAIL_TLS !== 'false',
-  },
-
-  // Supabase 配置
+  // Supabase 配置（系统级，所有租户共用同一个数据库）
   supabase: {
     url: process.env.SUPABASE_URL || 'https://tcqohwmdxnlbupancqor.supabase.co',
     anonKey: process.env.SUPABASE_ANON_KEY || '',
-    userId: process.env.SUPABASE_USER_ID || 'mahejun126',
   },
 
-  // 邮件筛选条件
+  // 邮件筛选条件（所有租户统一）
   filter: {
     sender: process.env.FILTER_SENDER || 'amazon',
     subject: process.env.FILTER_SUBJECT || 'Search term',
@@ -24,5 +16,5 @@ module.exports = {
   },
 
   // 数据存储表名
-  tableName: process.env.TABLE_NAME || 'amazon_ads_daily_data',
+  tableName: process.env.TABLE_NAME || 'amazon_ads_daily_reports',
 };
