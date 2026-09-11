@@ -13,27 +13,84 @@ function log(msg) {
   console.log(`[${time}] ${msg}`);
 }
 
-function searchEmails() {
+// ========== 多租户：从数据库读取所有启用了邮箱拉取的租户配置 ==========
+async function fetchAllTenantEmailConfigs() {
+  log('正在从数据库读取所有租户的邮箱配置...');
+
+  // 1. 读取所有租户
+  const { data: tenants, error: tenantError } = await supabase
+    .from('amazon_ads_tenants')
+    .select('id, tenant_code, tenant_name, status');
+
+  if (tenantError) throw new Error('读取租户列表失败: ' + tenantError.message);
+  log(`共找到 ${tenants.length} 个租户`);
+
+  // 2. 读取所有用户配置（筛选启用了邮箱拉取且有配置的）
+  const { data: configs, error: configError } = await supabase
+    .from('amazon_ads_user_configs')
+    .select('user_id, email_enabled, email_config')
+    .eq('email_enabled', true)
+    .not('email_config', 'is', null);
+
+  if (configError) throw new Error('读取邮箱配置失败: ' + configError.message);
+  log(`共找到 ${configs.length} 个启用了邮箱拉取的配置`);
+
+  // 3. 关联租户ID，组装成拉取任务列表
+  const tasks = [];
+  for (const cfg of configs) {
+    const tenant = tenants.find(t => t.tenant_code === cfg.user_id);
+    if (!tenant) {
+      log(`⚠️  配置 user_id=${cfg.user_id} 未找到对应租户，跳过`);
+      continue;
+    }
+    if (tenant.status !== 'active') {
+      log(`⚠️  租户 ${tenant.tenant_name} 状态非active，跳过`);
+      continue;
+    }
+    if (!cfg.email_config || !cfg.email_config.email || !cfg.email_config.password) {
+      log(`⚠️  租户 ${tenant.tenant_name} 邮箱配置不完整，跳过`);
+      continue;
+    }
+    tasks.push({
+      tenantId: tenant.id,
+      tenantCode: tenant.tenant_code,
+      tenantName: tenant.tenant_name,
+      userId: cfg.user_id,
+      email: cfg.email_config.email,
+      password: cfg.email_config.password,
+      host: cfg.email_config.host || 'imap.163.com',
+      port: parseInt(cfg.email_config.port || '993'),
+      tls: cfg.email_config.tls !== false,
+    });
+  }
+
+  log(`组装完成，共 ${tasks.length} 个租户需要拉取`);
+  tasks.forEach(t => log(`  - ${t.tenantName} (${t.tenantCode}): ${t.email}`));
+  return tasks;
+}
+
+// ========== 邮箱搜索（按租户配置） ==========
+function searchEmails(tenantConfig) {
   return new Promise((resolve, reject) => {
     const imap = new Imap({
-      user: config.email.user,
-      password: config.email.password,
-      host: config.email.host,
-      port: config.email.port,
-      tls: config.email.tls,
+      user: tenantConfig.email,
+      password: tenantConfig.password,
+      host: tenantConfig.host,
+      port: tenantConfig.port,
+      tls: tenantConfig.tls,
       connTimeout: 30000,
       authTimeout: 30000,
     });
 
     imap.once('ready', () => {
-      log('邮箱连接成功，发送IMAP ID标识...');
+      log(`[${tenantConfig.tenantName}] 邮箱连接成功，发送IMAP ID标识...`);
       imap.id({
         name: 'amz-email-fetcher',
-        version: '1.0',
+        version: '2.0-multitenant',
         vendor: 'amzAI',
-        contact: config.email.user
+        contact: tenantConfig.email
       }, () => {
-        log('IMAP ID标识已发送，开始搜索邮件...');
+        log(`[${tenantConfig.tenantName}] IMAP ID标识已发送，开始搜索邮件...`);
         imap.openBox('INBOX', true, (err, box) => {
           if (err) {
             imap.end();
@@ -65,7 +122,7 @@ function searchEmails() {
               msg.on('body', (stream, info) => {
                 simpleParser(stream, async (err, parsed) => {
                   if (err) {
-                    log('解析邮件失败: ' + err.message);
+                    log(`[${tenantConfig.tenantName}] 解析邮件失败: ` + err.message);
                     pending--;
                     if (pending === 0 && done) finish();
                     return;
@@ -79,7 +136,7 @@ function searchEmails() {
 
                   if (from.toLowerCase().includes(config.filter.sender.toLowerCase()) &&
                       subject.toLowerCase().includes(config.filter.subject.toLowerCase())) {
-                    log(`找到匹配邮件: ${subject} (${from})`);
+                    log(`[${tenantConfig.tenantName}] 找到匹配邮件: ${subject} (${from})`);
                     emails.push({ from, subject, date, html, text });
                   }
 
@@ -114,7 +171,7 @@ function searchEmails() {
     });
 
     imap.once('end', () => {
-      log('邮箱连接已关闭');
+      log(`[${tenantConfig.tenantName}] 邮箱连接已关闭`);
     });
 
     imap.connect();
@@ -180,14 +237,14 @@ function parseCSV(csvText) {
   });
 }
 
-// 适配新表结构 amazon_ads_daily_reports
-async function saveToSupabase(dateKey, rows, fileName) {
-  log(`正在存储数据到Supabase: date=${dateKey}, rows=${rows.length}`);
+// ========== 存储到Supabase（按租户隔离） ==========
+async function saveToSupabase(tenantConfig, dateKey, rows, fileName) {
+  log(`[${tenantConfig.tenantName}] 正在存储数据: date=${dateKey}, rows=${rows.length}`);
 
   const { data: existing, error: queryError } = await supabase
     .from(config.tableName)
     .select('*')
-    .eq('user_id', config.supabase.userId)
+    .eq('tenant_id', tenantConfig.tenantId)
     .eq('date_key', dateKey)
     .single();
 
@@ -199,7 +256,7 @@ async function saveToSupabase(dateKey, rows, fileName) {
   let source = 'email_auto';
 
   if (existing && existing.raw_data && existing.raw_data.length > 0) {
-    log(`当天已有 ${existing.raw_data.length} 行数据，正在合并去重...`);
+    log(`[${tenantConfig.tenantName}] 当天已有 ${existing.raw_data.length} 行数据，正在合并去重...`);
     const existingMap = new Map();
     existing.raw_data.forEach(row => {
       const key = `${row['搜索词'] || row['Search term'] || ''}_${row['活动名称'] || row['Campaign Name'] || ''}_${row['广告组'] || row['Ad Group'] || ''}`;
@@ -211,7 +268,7 @@ async function saveToSupabase(dateKey, rows, fileName) {
     });
     mergedRows = Array.from(existingMap.values());
     source = 'email_auto_merged';
-    log(`合并后共 ${mergedRows.length} 行数据`);
+    log(`[${tenantConfig.tenantName}] 合并后共 ${mergedRows.length} 行数据`);
   }
 
   // 计算汇总指标
@@ -224,7 +281,8 @@ async function saveToSupabase(dateKey, rows, fileName) {
   });
 
   const record = {
-    user_id: config.supabase.userId,
+    tenant_id: tenantConfig.tenantId,
+    user_id: tenantConfig.userId,
     date_key: dateKey,
     file_name: fileName,
     source: source,
@@ -246,7 +304,7 @@ async function saveToSupabase(dateKey, rows, fileName) {
     const { error: updateError } = await supabase
       .from(config.tableName)
       .update(record)
-      .eq('user_id', config.supabase.userId)
+      .eq('tenant_id', tenantConfig.tenantId)
       .eq('date_key', dateKey);
     if (updateError) throw new Error('更新数据失败: ' + updateError.message);
   } else {
@@ -257,36 +315,35 @@ async function saveToSupabase(dateKey, rows, fileName) {
     if (insertError) throw new Error('插入数据失败: ' + insertError.message);
   }
 
-  log(`数据存储成功: ${dateKey}, 共 ${mergedRows.length} 行`);
+  log(`[${tenantConfig.tenantName}] 数据存储成功: ${dateKey}, 共 ${mergedRows.length} 行`);
   return mergedRows.length;
 }
 
-async function processEmail(email) {
+async function processEmail(tenantConfig, email) {
   const dateKey = extractReportDate(email.subject);
-  log(`处理邮件: ${email.subject} (报告日期: ${dateKey})`);
+  log(`[${tenantConfig.tenantName}] 处理邮件: ${email.subject} (报告日期: ${dateKey})`);
 
   const downloadUrl = extractDownloadLink(email);
   if (!downloadUrl) throw new Error(`未找到下载链接: ${email.subject}`);
 
   const csvText = await downloadCSV(downloadUrl);
   const rows = await parseCSV(csvText);
-  log(`CSV解析完成: ${rows.length} 行, ${rows.length > 0 ? Object.keys(rows[0]).length : 0} 列`);
+  log(`[${tenantConfig.tenantName}] CSV解析完成: ${rows.length} 行, ${rows.length > 0 ? Object.keys(rows[0]).length : 0} 列`);
   if (rows.length === 0) throw new Error('CSV解析后无数据');
 
   const fileName = `Search_term_${dateKey}.csv`;
-  return await saveToSupabase(dateKey, rows, fileName);
+  return await saveToSupabase(tenantConfig, dateKey, rows, fileName);
 }
 
-async function fetchReports() {
-  const startTime = new Date();
-  log('========== 开始拉取亚马逊搜索词报告 ==========');
-
+// ========== 单个租户的拉取流程 ==========
+async function fetchReportsForTenant(tenantConfig) {
+  log(`========== 开始拉取租户 [${tenantConfig.tenantName}] 的报告 ==========`);
   try {
-    const emails = await searchEmails();
-    log(`共找到 ${emails.length} 封匹配邮件`);
+    const emails = await searchEmails(tenantConfig);
+    log(`[${tenantConfig.tenantName}] 共找到 ${emails.length} 封匹配邮件`);
 
     if (emails.length === 0) {
-      return { success: true, emailCount: 0, message: '未找到匹配的报告邮件' };
+      return { success: true, tenant: tenantConfig.tenantName, emailCount: 0, message: '未找到匹配的报告邮件' };
     }
 
     const dateMap = new Map();
@@ -294,25 +351,23 @@ async function fetchReports() {
       const dateKey = extractReportDate(email.subject);
       if (!dateMap.has(dateKey)) dateMap.set(dateKey, email);
     });
-    log(`去重后共 ${dateMap.size} 个不同日期的报告`);
+    log(`[${tenantConfig.tenantName}] 去重后共 ${dateMap.size} 个不同日期的报告`);
 
     const results = [];
     const errors = [];
     for (const [dateKey, email] of dateMap) {
       try {
-        const rowCount = await processEmail(email);
+        const rowCount = await processEmail(tenantConfig, email);
         results.push({ dateKey, rowCount });
       } catch (err) {
-        log(`处理 ${dateKey} 失败: ${err.message}`);
+        log(`[${tenantConfig.tenantName}] 处理 ${dateKey} 失败: ${err.message}`);
         errors.push({ dateKey, error: err.message });
       }
     }
 
-    const duration = ((new Date() - startTime) / 1000).toFixed(1);
-    log(`========== 拉取完成，成功 ${results.length} 个，失败 ${errors.length} 个，耗时 ${duration} 秒 ==========`);
-
     return {
       success: errors.length === 0,
+      tenant: tenantConfig.tenantName,
       emailCount: emails.length,
       processed: results.length,
       failed: errors.length,
@@ -320,26 +375,78 @@ async function fetchReports() {
       errors,
     };
   } catch (error) {
-    log('拉取失败: ' + error.message);
-    return { success: false, error: error.message };
+    log(`[${tenantConfig.tenantName}] 拉取失败: ${error.message}`);
+    return { success: false, tenant: tenantConfig.tenantName, error: error.message };
   }
 }
 
+// ========== 主流程：多租户循环拉取 ==========
 async function main() {
-  log('亚马逊广告AI分析助手 - 邮箱自动拉取服务（GitHub Actions版 v2）');
-  log(`邮箱: ${config.email.user}`);
-  log(`IMAP: ${config.email.host}:${config.email.port}`);
+  const startTime = new Date();
+  log('==================================================');
+  log('亚马逊广告AI分析助手 - 多租户邮箱自动拉取服务 v3.0');
   log(`Supabase: ${config.supabase.url}`);
   log(`数据表: ${config.tableName}`);
-  log('----------------------------------------');
+  log(`邮件筛选: 发件人含"${config.filter.sender}", 主题含"${config.filter.subject}", 最近${config.filter.days}天`);
+  log('==================================================');
 
-  const result = await fetchReports();
-  if (!result.success) {
-    console.error('::error::拉取失败: ' + (result.error || JSON.stringify(result.errors)));
+  try {
+    // 1. 读取所有租户的邮箱配置
+    const tenantTasks = await fetchAllTenantEmailConfigs();
+
+    if (tenantTasks.length === 0) {
+      log('没有租户启用邮箱拉取，任务结束');
+      console.log('::set-output name=result::' + JSON.stringify({ success: true, message: '没有启用邮箱拉取的租户' }));
+      process.exit(0);
+    }
+
+    // 2. 循环每个租户拉取
+    const allResults = [];
+    let totalSuccess = 0;
+    let totalFailed = 0;
+
+    for (const tenantConfig of tenantTasks) {
+      log('');
+      const result = await fetchReportsForTenant(tenantConfig);
+      allResults.push(result);
+      if (result.success) totalSuccess++;
+      else totalFailed++;
+      // 租户之间间隔2秒，避免IMAP连接过于频繁
+      if (tenantTasks.indexOf(tenantConfig) < tenantTasks.length - 1) {
+        await new Promise(r => setTimeout(r, 2000));
+      }
+    }
+
+    const duration = ((new Date() - startTime) / 1000).toFixed(1);
+    log('');
+    log('==================================================');
+    log(`全部拉取完成: 成功 ${totalSuccess}/${tenantTasks.length} 个租户, 失败 ${totalFailed} 个, 总耗时 ${duration} 秒`);
+    allResults.forEach(r => {
+      const status = r.success ? '✅' : '❌';
+      log(`  ${status} ${r.tenant}: ${r.success ? `处理${r.processed}个报告` : r.error || `${r.failed}个失败`}`);
+    });
+    log('==================================================');
+
+    const finalResult = {
+      success: totalFailed === 0,
+      totalTenants: tenantTasks.length,
+      successCount: totalSuccess,
+      failedCount: totalFailed,
+      duration: duration + 's',
+      results: allResults,
+    };
+
+    console.log('::set-output name=result::' + JSON.stringify(finalResult));
+
+    if (totalFailed > 0) {
+      console.error('::warning::部分租户拉取失败，请查看日志详情');
+    }
+    process.exit(0);
+  } catch (error) {
+    log('致命错误: ' + error.message);
+    console.error('::error::拉取失败: ' + error.message);
     process.exit(1);
   }
-  console.log('::set-output name=result::' + JSON.stringify(result));
-  process.exit(0);
 }
 
 main();
