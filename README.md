@@ -1,122 +1,83 @@
-# 亚马逊广告数据每日自动拉取（GitHub Actions版）
+# 亚马逊广告邮箱自动拉取（多租户版）
 
-每天北京时间22点自动从邮箱拉取亚马逊搜索词报告，解析后存到Supabase数据库。
+每天定时从各租户的邮箱拉取亚马逊搜索词报告，自动存入Supabase数据库。
 
-## 功能特点
+## 工作原理
 
-- ✅ 完全免费（GitHub Actions免费额度）
-- ✅ 不需要开电脑，GitHub云端自动运行
-- ✅ 支持163邮箱（已处理IMAP ID标识问题）
-- ✅ 自动去重合并（同一天的多份报告合并）
-- ✅ 失败自动发邮件通知
-- ✅ 支持手动触发测试
+```
+GitHub Actions 每天22:00触发
+    ↓
+从Supabase读取所有启用了邮箱拉取的租户配置
+    ↓
+循环每个租户，用各自的邮箱+授权码连接IMAP拉取报告
+    ↓
+按租户ID隔离存入 amazon_ads_daily_reports 表
+```
 
-## 部署步骤（5分钟搞定）
+## 多租户数据隔离
 
-### 第一步：注册GitHub账号
+- 每个租户在系统设置页配置自己的邮箱（邮箱地址、授权码、IMAP服务器）
+- 配置存在 `amazon_ads_user_configs` 表的 `email_config` 字段，按 `user_id`（=租户code）隔离
+- 拉取到的数据存入 `amazon_ads_daily_reports` 表，带 `tenant_id` 字段
+- 租户之间数据完全隔离，互不可见
 
-1. 打开 https://github.com
-2. 点击 Sign up 注册账号（免费）
-3. 验证邮箱
+## 租户配置要求
 
-### 第二步：创建仓库
+每个租户需要在系统设置页配置：
+1. 开启"邮箱自动拉取"开关
+2. 填写邮箱地址（如 xxx@163.com）
+3. 填写邮箱授权码（不是登录密码）
+4. IMAP服务器（默认 imap.163.com:993 SSL）
 
-1. 登录后点击右上角 `+` → `New repository`
-2. Repository name 填：`amz-email-fetcher`
-3. 选 `Public`（公开，免费版也能用Actions）
-4. 勾选 `Add a README file`
-5. 点击 `Create repository`
+配置后，GitHub Actions会自动识别并拉取该租户的报告。
 
-### 第三步：上传文件
+## GitHub Secrets 配置
 
-1. 在仓库页面点击 `Add file` → `Upload files`
-2. 把这个文件夹里的所有文件拖进去（包括 `.github` 文件夹）
-   - index.js
-   - config.js
-   - package.json
-   - .gitignore
-   - .github/workflows/fetch.yml
-3. 底部点击 `Commit changes`
+在仓库 Settings → Secrets and variables → Actions 中配置：
 
-### 第四步：配置密钥（Secrets）
+| Secret名称 | 说明 |
+|---|---|
+| `SUPABASE_URL` | Supabase项目URL |
+| `SUPABASE_ANON_KEY` | Supabase anon key |
 
-1. 在仓库页面点击 `Settings`
-2. 左侧菜单找到 `Secrets and variables` → `Actions`
-3. 点击 `New repository secret`，逐个添加以下密钥：
+> 注意：邮箱配置不再需要存在Secrets里，直接从数据库按租户读取。
 
-| Name（名称） | Value（值） | 说明 |
-|---|---|---|
-| `EMAIL_USER` | `mahejun163@163.com` | 你的邮箱地址 |
-| `EMAIL_PASSWORD` | `YP3Phh6SG99FZief` | 邮箱授权码（不是登录密码） |
-| `EMAIL_HOST` | `imap.163.com` | IMAP服务器 |
-| `EMAIL_PORT` | `993` | IMAP端口 |
-| `SUPABASE_URL` | `https://tcqohwmdxnlbupancqor.supabase.co` | Supabase项目URL |
-| `SUPABASE_ANON_KEY` | `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...` | Supabase anon key |
-| `SUPABASE_USER_ID` | `mahejun126` | 用户标识 |
-| `FILTER_SENDER` | `amazon` | 发件人筛选关键词 |
-| `FILTER_SUBJECT` | `Search term` | 主题筛选关键词 |
-| `FILTER_DAYS` | `7` | 搜索最近几天的邮件 |
-| `TABLE_NAME` | `amazon_ads_daily_data` | 数据库表名 |
+完整的SUPABASE_ANON_KEY：
+`eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRjcW9od21keG5sYnVwYW5jcW9yIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg4Nzg3MzMsImV4cCI6MjEwNDQ1NDczM30.TE5eXH9z6pq2KxfPmZcMDPQGCP67NBYAOtxEWlPocgs`
 
-> 注意：SUPABASE_ANON_KEY 的完整值是：
-> `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRjcW9od21keG5sYnVwYW5jcW9yIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg4Nzg3MzMsImV4cCI6MjEwNDQ1NDczM30.TE5eXH9z6pq2KxfPmZcMDPQGCP67NBYAOtxEWlPocgs`
+## 手动触发
 
-### 第五步：手动测试一次
+在仓库 Actions 页面，选择"亚马逊广告数据每日拉取"workflow，点击 Run workflow。
 
-1. 点击仓库顶部的 `Actions` 标签
-2. 左侧选 `亚马逊广告数据每日拉取`
-3. 点击 `Run workflow` → 选 `main` 分支 → 点击 `Run workflow`
-4. 等1-2分钟，看运行结果
-5. 如果显示绿色对勾，说明成功了
-6. 如果失败，点进去看日志，把错误发我
+## 日志说明
 
-### 第六步：完成
-
-从此以后，每天北京时间22点自动运行，不需要你做任何事。
-
-## 查看运行记录
-
-1. 仓库页面 → `Actions` 标签
-2. 可以看到每次运行的状态、日志、耗时
-3. 失败会自动发邮件到你的GitHub注册邮箱
+运行日志会显示：
+- 共找到多少个启用了邮箱拉取的租户
+- 每个租户拉取了多少封邮件
+- 每个报告处理成功/失败
+- 最终汇总统计（成功/失败租户数）
 
 ## 修改拉取时间
 
-如果想改时间，编辑 `.github/workflows/fetch.yml` 里的 cron 表达式：
+编辑 `.github/workflows/fetch.yml` 里的 cron 表达式：
 
 ```yaml
 schedule:
   - cron: '0 14 * * *'  # UTC时间14点 = 北京时间22点
 ```
 
-北京时间 = UTC时间 + 8小时，所以：
-- 北京时间22点 = UTC 14点 → `0 14 * * *`
-- 北京时间早上8点 = UTC 0点 → `0 0 * * *`
-- 北京时间中午12点 = UTC 4点 → `0 4 * * *`
-
-## 换邮箱怎么办？
-
-如果以后换邮箱（比如换成QQ邮箱、Gmail）：
-1. 在 Settings → Secrets 里更新 `EMAIL_USER`、`EMAIL_PASSWORD`、`EMAIL_HOST`、`EMAIL_PORT`
-2. 常见邮箱IMAP配置：
-   - 163邮箱：imap.163.com:993
-   - QQ邮箱：imap.qq.com:993
-   - Gmail：imap.gmail.com:993
-   - Outlook：imap-mail.outlook.com:993
+北京时间 = UTC时间 + 8小时。
 
 ## 常见问题
 
 **Q: 免费额度够用吗？**
-A: GitHub免费版每月2000分钟，每次运行约1分钟，每天1次，一个月才30分钟，完全够用。
+A: GitHub免费版每月2000分钟，每次运行约1-2分钟，每天1次，一个月才30-60分钟，完全够用。
 
-**Q: 会泄露我的邮箱密码吗？**
-A: 不会。Secrets是加密存储的，只有Actions运行时才能读取，连你自己都看不到明文。
+**Q: 租户的邮箱授权码安全吗？**
+A: 授权码存在Supabase数据库中，按租户隔离。GitHub Actions运行时通过API读取，不会明文输出到日志。
 
-**Q: 报告邮件在垃圾邮箱里怎么办？**
-A: 脚本默认只搜收件箱。如果亚马逊报告在垃圾邮箱，需要在邮箱里设置过滤器，把亚马逊的邮件标记为非垃圾邮件。
-
-**Q: 一天收到多份报告怎么办？**
-A: 脚本会按报告日期去重，同一天只保留最新的一份，并且和已有数据合并去重。
+**Q: 新租户怎么启用自动拉取？**
+A: 新租户在系统设置页开启"邮箱自动拉取"，填写邮箱和授权码即可。下次GitHub Actions运行时会自动识别并拉取。
 
 **Q: 怎么确认数据存进去了？**
-A: 打开你的亚马逊广告AI分析助手应用，看历史日期里有没有新的数据。
+A: 租户登录系统后，看历史日期里有没有新的数据。数据按tenant_id隔离，每个租户只能看到自己的。
