@@ -2,8 +2,8 @@ name: 亚马逊广告数据每日拉取
 
 on:
   schedule:
-    # 每天北京时间22点执行（UTC时间14点）
-    - cron: '0 14 * * *'
+    # 北京时间16点到22点，每2小时一次（UTC 8、10、12、14点 = 北京16、18、20、22点）
+    - cron: '0 8,10,12,14 * * *'
   # 支持手动触发
   workflow_dispatch:
 
@@ -11,7 +11,6 @@ jobs:
   fetch-reports:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -26,15 +25,6 @@ jobs:
 
       - name: 执行拉取
         env:
-          EMAIL_USER: ${{ secrets.EMAIL_USER }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          EMAIL_HOST: ${{ secrets.EMAIL_HOST }}
-          EMAIL_PORT: ${{ secrets.EMAIL_PORT }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-          SUPABASE_USER_ID: ${{ secrets.SUPABASE_USER_ID }}
-          FILTER_SENDER: ${{ secrets.FILTER_SENDER }}
-          FILTER_SUBJECT: ${{ secrets.FILTER_SUBJECT }}
-          FILTER_DAYS: ${{ secrets.FILTER_DAYS }}
-          TABLE_NAME: ${{ secrets.TABLE_NAME }}
         run: node index.js
