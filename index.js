@@ -205,12 +205,42 @@ function extractDownloadLink(email) {
   return link;
 }
 
-function extractReportDate(subject) {
-  const match = subject.match(/(\d{2})\/(\d{2})\/(\d{4})/);
-  if (match) {
-    return `${match[3]}-${match[1]}-${match[2]}`;
+// 从CSV行数据的"日期"列提取数据日期（格式：2026年9月10日 → 2026-09-10）
+// 注意：邮件主题里的日期是报告生成时间，不是数据日期，必须从CSV内容提取
+function extractDatesFromRows(rows) {
+  const dateSet = new Set();
+  for (const row of rows) {
+    const dateStr = row['日期'] || row['Date'] || '';
+    if (!dateStr) continue;
+    // 匹配 "2026年9月10日" 格式
+    const match = dateStr.match(/(\d{4})年(\d{1,2})月(\d{1,2})日/);
+    if (match) {
+      const y = match[1];
+      const m = match[2].padStart(2, '0');
+      const d = match[3].padStart(2, '0');
+      dateSet.add(`${y}-${m}-${d}`);
+    }
   }
-  return new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' }).slice(0, 10);
+  return Array.from(dateSet).sort();
+}
+
+// 按日期分组行数据
+function groupRowsByDate(rows) {
+  const groups = {};
+  for (const row of rows) {
+    const dateStr = row['日期'] || row['Date'] || '';
+    const match = dateStr.match(/(\d{4})年(\d{1,2})月(\d{1,2})日/);
+    let dateKey;
+    if (match) {
+      dateKey = `${match[1]}-${match[2].padStart(2, '0')}-${match[3].padStart(2, '0')}`;
+    } else {
+      // 没有日期列的行，归入当天
+      dateKey = new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' }).slice(0, 10);
+    }
+    if (!groups[dateKey]) groups[dateKey] = [];
+    groups[dateKey].push(row);
+  }
+  return groups;
 }
 
 async function downloadCSV(url) {
@@ -320,8 +350,7 @@ async function saveToSupabase(tenantConfig, dateKey, rows, fileName) {
 }
 
 async function processEmail(tenantConfig, email) {
-  const dateKey = extractReportDate(email.subject);
-  log(`[${tenantConfig.tenantName}] 处理邮件: ${email.subject} (报告日期: ${dateKey})`);
+  log(`[${tenantConfig.tenantName}] 处理邮件: ${email.subject}`);
 
   const downloadUrl = extractDownloadLink(email);
   if (!downloadUrl) throw new Error(`未找到下载链接: ${email.subject}`);
@@ -331,8 +360,28 @@ async function processEmail(tenantConfig, email) {
   log(`[${tenantConfig.tenantName}] CSV解析完成: ${rows.length} 行, ${rows.length > 0 ? Object.keys(rows[0]).length : 0} 列`);
   if (rows.length === 0) throw new Error('CSV解析后无数据');
 
-  const fileName = `Search_term_${dateKey}.csv`;
-  return await saveToSupabase(tenantConfig, dateKey, rows, fileName);
+  // 从CSV内容提取数据日期（不再用邮件主题的日期）
+  const dates = extractDatesFromRows(rows);
+  log(`[${tenantConfig.tenantName}] CSV中包含的数据日期: ${dates.join(', ') || '未找到日期列'}`);
+
+  if (dates.length === 0) {
+    // 没有日期列，用当天日期兜底
+    const today = new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' }).slice(0, 10);
+    log(`[${tenantConfig.tenantName}] 未找到日期列，使用当天日期 ${today}`);
+    const fileName = `Search_term_${today}.csv`;
+    const count = await saveToSupabase(tenantConfig, today, rows, fileName);
+    return [{ dateKey: today, rowCount: count }];
+  }
+
+  // 按日期拆分存储
+  const groups = groupRowsByDate(rows);
+  const results = [];
+  for (const [dateKey, dateRows] of Object.entries(groups)) {
+    const fileName = `Search_term_${dateKey}.csv`;
+    const count = await saveToSupabase(tenantConfig, dateKey, dateRows, fileName);
+    results.push({ dateKey, rowCount: count });
+  }
+  return results;
 }
 
 // ========== 单个租户的拉取流程 ==========
@@ -346,32 +395,37 @@ async function fetchReportsForTenant(tenantConfig) {
       return { success: true, tenant: tenantConfig.tenantName, emailCount: 0, message: '未找到匹配的报告邮件' };
     }
 
-    const dateMap = new Map();
-    emails.forEach(email => {
-      const dateKey = extractReportDate(email.subject);
-      if (!dateMap.has(dateKey)) dateMap.set(dateKey, email);
-    });
-    log(`[${tenantConfig.tenantName}] 去重后共 ${dateMap.size} 个不同日期的报告`);
+    // 不再按邮件主题日期去重（主题日期是报告生成时间，不是数据日期）
+    // 所有邮件都处理，存储时saveToSupabase会按数据日期自动合并去重
+    log(`[${tenantConfig.tenantName}] 共 ${emails.length} 封邮件，全部处理（存储时按数据日期合并去重）`);
 
-    const results = [];
+    const allResults = [];
     const errors = [];
-    for (const [dateKey, email] of dateMap) {
+    for (let i = 0; i < emails.length; i++) {
+      const email = emails[i];
       try {
-        const rowCount = await processEmail(tenantConfig, email);
-        results.push({ dateKey, rowCount });
+        const dateResults = await processEmail(tenantConfig, email);
+        allResults.push(...dateResults);
       } catch (err) {
-        log(`[${tenantConfig.tenantName}] 处理 ${dateKey} 失败: ${err.message}`);
-        errors.push({ dateKey, error: err.message });
+        log(`[${tenantConfig.tenantName}] 处理邮件[${i+1}]失败: ${err.message}`);
+        errors.push({ email: email.subject, error: err.message });
       }
     }
+
+    // 按日期汇总
+    const dateSummary = {};
+    allResults.forEach(r => {
+      if (!dateSummary[r.dateKey]) dateSummary[r.dateKey] = 0;
+      dateSummary[r.dateKey] += r.rowCount;
+    });
 
     return {
       success: errors.length === 0,
       tenant: tenantConfig.tenantName,
       emailCount: emails.length,
-      processed: results.length,
+      processed: Object.keys(dateSummary).length,
       failed: errors.length,
-      results,
+      results: Object.entries(dateSummary).map(([dateKey, rowCount]) => ({ dateKey, rowCount })),
       errors,
     };
   } catch (error) {
