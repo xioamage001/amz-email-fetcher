@@ -1,16 +1,15 @@
 {
-  "name": "amz-email-fetcher",
-  "version": "1.0.0",
-  "description": "每天自动从邮箱拉取亚马逊搜索词报告，解析后存到Supabase",
+  "name": "amazon-ads-email-fetcher",
+  "version": "3.2.0",
+  "private": true,
+  "description": "从各租户邮箱自动拉取亚马逊搜索词报告（每天更新、最近7天滚动），强制覆盖窗口内日期，存入Supabase",
   "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
+  "engines": { "node": ">=18" },
   "dependencies": {
-    "@supabase/supabase-js": "^2.45.0",
+    "@supabase/supabase-js": "^2.45.4",
     "cheerio": "^1.0.0",
     "imap": "^0.8.19",
-    "mailparser": "^3.7.0",
+    "mailparser": "^3.7.1",
     "node-fetch": "^2.7.0",
     "papaparse": "^5.4.1"
   }
