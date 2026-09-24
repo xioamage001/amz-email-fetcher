@@ -12,7 +12,7 @@ module.exports = {
   filter: {
     sender: process.env.FILTER_SENDER || 'amazon',
     subject: process.env.FILTER_SUBJECT || 'Search term',
-    days: parseInt(process.env.FILTER_DAYS || '3'),
+        days: parseInt(process.env.FILTER_DAYS || '5'),
   },
 
   // 数据存储表名
